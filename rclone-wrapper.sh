@@ -1,91 +1,154 @@
 #!/bin/bash
 set -e
 
-# ==================== 0. 环境变量 ====================
-REPO_URL="$GW_REPO_URL"
-USERNAME="${GW_USER:-git}" 
-PAT="$GW_PAT"
-BRANCH="${GW_BRANCH:-main}"
-INTERVAL="${GW_INTERVAL:-300}"
-SYNC_MAP="$GW_SYNC_MAP"
+# ==================== 0. 环境变量读取 ====================
 
-# === 截断配置 ===
-# 当提交数超过这个值时，重置历史为 1 个提交
-# 设为 0 则不限制
-HISTORY_LIMIT="${GW_HISTORY_LIMIT:-50}"
+# 必填配置
+RCLONE_CONFIG_B64="$RW_RCLONE_CONFIG"
+BASE_DIR="$RW_BASE_DIR"
+SYNC_MAP="$RW_SYNC_MAP"
 
-# 继承参数
-ORIGINAL_ENTRYPOINT="$GW_ORIGINAL_ENTRYPOINT"
-ORIGINAL_CMD="$GW_ORIGINAL_CMD"
-ORIGINAL_WORKDIR="$GW_ORIGINAL_WORKDIR"
+# 可选配置
+REMOTE_NAME="${RW_REMOTE_NAME:-}"
+INTERVAL="${RW_INTERVAL:-300}"
+RCLONE_FLAGS="${RW_RCLONE_FLAGS:-}"
 
-GIT_STORE="/git-store"
+# 默认 rclone 优化参数（如果用户未指定）
+if [ -z "$RCLONE_FLAGS" ]; then
+    # 设置合理的默认值：
+    # --transfers=4: 并发传输 4 个文件（平衡速度和资源）
+    # --checkers=8: 并发检查 8 个文件
+    # --contimeout=60s: 连接超时 60 秒
+    # --timeout=300s: 传输超时 5 分钟
+    # --retries=3: 失败重试 3 次
+    RCLONE_FLAGS="--transfers=4 --checkers=8 --contimeout=60s --timeout=300s --retries=3"
+fi
 
-# ==================== 1. 准备工作 ====================
+# 快照配置
+SNAPSHOT_ENABLED="${RW_SNAPSHOT_ENABLED:-true}"
+SNAPSHOT_INTERVAL="${RW_SNAPSHOT_INTERVAL:-900}"
+SNAPSHOT_KEEP_RECENT="${RW_SNAPSHOT_KEEP_RECENT:-10}"
+SNAPSHOT_KEEP_DAYS="${RW_SNAPSHOT_KEEP_DAYS:-7}"
+
+# 调试配置
+DEBUG="${RW_DEBUG:-false}"
+
+# 继承的原始镜像参数
+ORIGINAL_ENTRYPOINT="$RW_ORIGINAL_ENTRYPOINT"
+ORIGINAL_CMD="$RW_ORIGINAL_CMD"
+ORIGINAL_WORKDIR="$RW_ORIGINAL_WORKDIR"
+
+# 全局变量
+APP_PID=""
+BACKUP_PID=""
+SNAPSHOT_PID=""
+
+# ==================== 1. 日志函数 ====================
+
+log_info() {
+    echo "[RcloneWrapper] [INFO] $(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+log_warn() {
+    echo "[RcloneWrapper] [WARN] $(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+log_error() {
+    echo "[RcloneWrapper] [ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+log_debug() {
+    if [ "$DEBUG" = "true" ]; then
+        echo "[RcloneWrapper] [DEBUG] $(date '+%Y-%m-%d %H:%M:%S') $*"
+    fi
+}
+
+# ==================== 2. 配置管理模块 ====================
+
 init_config() {
-    if [ -z "$REPO_URL" ] || [ -z "$PAT" ] || [ -z "$SYNC_MAP" ]; then
-        echo "[GitWrapper] [ERROR] Missing required environment variables!"
-        echo "[GitWrapper] [ERROR] Required: GW_REPO_URL, GW_PAT, GW_SYNC_MAP"
-        echo "[GitWrapper] [WARN] Wrapper will start container without sync functionality"
+    log_info ">>> Initializing configuration..."
+    
+    # 验证必填环境变量
+    if [ -z "$RCLONE_CONFIG_B64" ] || [ -z "$BASE_DIR" ] || [ -z "$SYNC_MAP" ]; then
+        log_error "Missing required environment variables!"
+        log_error "Required: RW_RCLONE_CONFIG, RW_BASE_DIR, RW_SYNC_MAP"
+        log_warn "Wrapper will start container without sync functionality"
         return 1
     fi
-
-    case "$REPO_URL" in
-        http://*) PROTOCOL="http://" ;;
-        *)        PROTOCOL="https://" ;;
-    esac
-    CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
-    AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
     
+    # 解码并写入 rclone 配置
+    mkdir -p /root/.config/rclone
+    if ! echo "$RCLONE_CONFIG_B64" | base64 -d > /root/.config/rclone/rclone.conf 2>/dev/null; then
+        log_error "Failed to decode RW_RCLONE_CONFIG (invalid BASE64)"
+        log_warn "Wrapper will start container without sync functionality"
+        return 1
+    fi
+    
+    log_debug "Rclone config written to /root/.config/rclone/rclone.conf"
+    
+    # 验证 rclone 配置有效性
+    if ! rclone listremotes > /dev/null 2>&1; then
+        log_error "Invalid rclone configuration (rclone listremotes failed)"
+        log_warn "Wrapper will start container without sync functionality"
+        return 1
+    fi
+    
+    # 确定 REMOTE_NAME
+    if [ -z "$REMOTE_NAME" ]; then
+        REMOTE_NAME=$(rclone listremotes | head -n1 | tr -d ':')
+        log_info "Auto-detected remote: $REMOTE_NAME"
+    fi
+    
+    # 输出配置摘要（脱敏）
+    log_info "Configuration Summary:"
+    log_info "  Remote: $REMOTE_NAME"
+    log_info "  Base Dir: $BASE_DIR"
+    log_info "  Sync Map: $SYNC_MAP"
+    log_info "  Backup Interval: ${INTERVAL}s"
+    log_info "  Snapshot Enabled: $SNAPSHOT_ENABLED"
+    if [ "$SNAPSHOT_ENABLED" = "true" ]; then
+        log_info "  Snapshot Interval: ${SNAPSHOT_INTERVAL}s"
+        log_info "  Snapshot Keep Recent: $SNAPSHOT_KEEP_RECENT"
+        log_info "  Snapshot Keep Days: $SNAPSHOT_KEEP_DAYS"
+    fi
+    log_info "  Rclone Config Length: ${#RCLONE_CONFIG_B64} chars (BASE64)"
+    
+    log_info "Configuration initialized successfully"
     return 0
 }
 
-# ==================== 2. 核心逻辑 ====================
+# ==================== 3. 数据恢复模块 ====================
 
 restore_data() {
-    echo "[GitWrapper] >>> Initializing..."
-    git config --global --add safe.directory "$GIT_STORE"
-    git config --global user.name "${USERNAME:-BackupBot}"
-    git config --global user.email "${USERNAME:-bot}@wrapper.local"
-    git config --global init.defaultBranch "$BRANCH"
-
-    if [ -d "$GIT_STORE" ]; then rm -rf "$GIT_STORE"; fi
+    log_info ">>> Restoring data from cloud storage..."
+    local start_time=$(date +%s)
     
-    git clone "$AUTH_URL" "$GIT_STORE" > /dev/null 2>&1 || true
-
-    if [ ! -d "$GIT_STORE/.git" ]; then
-        echo "[GitWrapper] [ERROR] Clone failed."
-        return
-    fi
-
-    cd "$GIT_STORE"
-
-    # 空仓库初始化
-    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-        echo "[GitWrapper] [WARN] Empty repo. Initializing..."
-        git checkout -b "$BRANCH" 2>/dev/null || true
-        git commit --allow-empty -m "Init"
-        git push -u origin "$BRANCH"
-    else
-        git checkout "$BRANCH" 2>/dev/null || true
-    fi
-
+    # 解析 SYNC_MAP: 
+    # 格式1: dir:src_dir:/container/path (明确指定类型)
+    # 格式2: file:src_dir:/container/path (明确指定类型)
+    # 格式3: src_dir:/container/path (自动判断)
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
+    
     for MAPPING in "${MAPPINGS[@]}"; do
+        # 跳过空映射
+        if [ -z "$MAPPING" ]; then
+            continue
+        fi
+        
         # 解析映射
         IFS=':' read -ra PARTS <<< "$MAPPING"
         local path_type=""
-        local remote_rel=""
+        local src_dir=""
         local local_path=""
         
         if [ ${#PARTS[@]} -eq 3 ]; then
-            # 格式: type:remote_rel:local_path
+            # 格式: type:src_dir:local_path
             path_type="${PARTS[0]}"
-            remote_rel="${PARTS[1]}"
+            src_dir="${PARTS[1]}"
             local_path="${PARTS[2]}"
         elif [ ${#PARTS[@]} -eq 2 ]; then
-            # 格式: remote_rel:local_path (自动判断)
-            remote_rel="${PARTS[0]}"
+            # 格式: src_dir:local_path (需要自动判断)
+            src_dir="${PARTS[0]}"
             local_path="${PARTS[1]}"
             # 通过扩展名猜测
             if [[ "$local_path" =~ \.[a-zA-Z0-9]+$ ]]; then
@@ -94,182 +157,458 @@ restore_data() {
                 path_type="dir"
             fi
         else
-            echo "[GitWrapper] [ERROR] Invalid SYNC_MAP format: $MAPPING"
+            log_error "Invalid SYNC_MAP format: $MAPPING"
             continue
         fi
         
-        REMOTE_PATH="$GIT_STORE/$remote_rel"
-
-        if [ -e "$REMOTE_PATH" ]; then
-            echo "[GitWrapper] Restore: $remote_rel -> $local_path"
-            mkdir -p "$(dirname "$local_path")"
-            rm -rf "$local_path"
-            cp -r "$REMOTE_PATH" "$local_path"
-            # [还原] 脱隐身衣
-            if [ -d "$local_path" ]; then
-                find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
-            fi
-        else
-            # Git 仓库中路径不存在（新容器初始化）
-            if [ "$path_type" = "dir" ]; then
-                # 目录类型：预先创建，防止应用写入时报错
-                echo "[GitWrapper] Creating directory for app: $local_path"
+        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
+        
+        log_info "Restoring: $remote_path -> $local_path (type: $path_type)"
+        
+        # 检查远程路径是否存在
+        if ! rclone lsf "$remote_path" > /dev/null 2>&1; then
+            log_warn "Remote path not found (new container init): $remote_path"
+            
+            # 根据类型决定是否创建本地路径
+            if [ "$path_type" = "dir" ] || [ "$path_type" = "auto" ]; then
+                # 目录类型：预先创建，防止应用写入时报错（类似 Docker 挂载）
+                log_info "Creating directory for app: $local_path"
                 mkdir -p "$local_path"
             else
                 # 文件类型：跳过，不创建文件
-                echo "[GitWrapper] Skipping file creation, let app initialize: $local_path"
+                log_info "Skipping file creation, let app initialize: $local_path"
             fi
+            
+            continue
+        fi
+        
+        # 如果远程存在，用远程判断类型（覆盖猜测）
+        # 使用 rclone lsd 检查远程路径本身是否是目录
+        if rclone lsd "$(dirname "$remote_path")" 2>/dev/null | grep -q "$(basename "$remote_path")"; then
+            # 远程路径本身是一个目录
+            path_type="dir"
+            log_debug "Remote detected as directory"
+        else
+            # 远程路径是一个文件
+            path_type="file"
+            log_debug "Remote detected as file"
+        fi
+        
+        # 删除本地旧数据
+        log_debug "Removing old local data: $local_path"
+        rm -rf "$local_path"
+        
+        # 创建父目录
+        mkdir -p "$(dirname "$local_path")"
+        
+        # 使用临时目录确保一致性
+        local temp_dir="/tmp/rclone-restore-$$-$(date +%s)"
+        mkdir -p "$temp_dir"
+        
+        log_debug "Syncing from cloud to temp: $remote_path -> $temp_dir"
+        if rclone sync "$remote_path" "$temp_dir" \
+            --exclude "snapshots/**" \
+            ${RCLONE_FLAGS} \
+            --log-level INFO 2>&1 | grep -v "^20" || true; then
+            
+            # 同步成功，根据类型复制到目标位置
+            log_debug "Copying from temp to target: $temp_dir -> $local_path (type: $path_type)"
+            
+            if [ "$path_type" = "file" ]; then
+                # 单文件：复制第一个文件
+                local first_file=$(find "$temp_dir" -type f | head -n1)
+                if [ -n "$first_file" ]; then
+                    cp "$first_file" "$local_path"
+                fi
+            else
+                # 目录：创建目录并复制内容
+                mkdir -p "$local_path"
+                if [ "$(ls -A $temp_dir 2>/dev/null)" ]; then
+                    cp -r "$temp_dir"/* "$local_path/" 2>/dev/null || true
+                    cp -r "$temp_dir"/.[!.]* "$local_path/" 2>/dev/null || true
+                fi
+            fi
+            
+            # 清理临时目录
+            rm -rf "$temp_dir"
+            
+            log_info "Restore success: $src_dir"
+        else
+            log_error "Restore failed: $src_dir (continuing anyway)"
+            rm -rf "$temp_dir"
         fi
     done
+    
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    log_info "Restore complete (${elapsed}s)"
 }
+
+# ==================== 4. 数据备份模块 ====================
 
 backup_data() {
-    if [ ! -d "$GIT_STORE/.git" ]; then return; fi
+    log_info ">>> Backing up data to cloud storage..."
+    local start_time=$(date +%s)
     
+    # 解析 SYNC_MAP
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
+    
     for MAPPING in "${MAPPINGS[@]}"; do
-        REMOTE_REL=$(echo "$MAPPING" | cut -d':' -f1)
-        REMOTE_FULL="$GIT_STORE/$REMOTE_REL"
-        LOCAL_PATH="$(echo "$MAPPING" | cut -d':' -f2)"
+        # 跳过空映射
+        if [ -z "$MAPPING" ]; then
+            continue
+        fi
+        
+        # 解析映射
+        IFS=':' read -ra PARTS <<< "$MAPPING"
+        local path_type=""
+        local src_dir=""
+        local local_path=""
+        
+        if [ ${#PARTS[@]} -eq 3 ]; then
+            # 格式: type:src_dir:local_path
+            path_type="${PARTS[0]}"
+            src_dir="${PARTS[1]}"
+            local_path="${PARTS[2]}"
+        elif [ ${#PARTS[@]} -eq 2 ]; then
+            # 格式: src_dir:local_path (需要自动判断)
+            src_dir="${PARTS[0]}"
+            local_path="${PARTS[1]}"
+            path_type="auto"
+        else
+            log_error "Invalid SYNC_MAP format: $MAPPING"
+            continue
+        fi
+        
+        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
+        
+        # 检查本地路径是否存在
+        if [ ! -e "$local_path" ]; then
+            log_warn "Local path not found, skipping: $local_path"
+            continue
+        fi
+        
+        # 如果是 auto，根据本地路径判断类型
+        if [ "$path_type" = "auto" ]; then
+            if [ -f "$local_path" ]; then
+                path_type="file"
+            elif [ -d "$local_path" ]; then
+                path_type="dir"
+            else
+                log_warn "Unknown path type: $local_path"
+                continue
+            fi
+        fi
+        
+        log_info "Backing up: $local_path -> $remote_path (type: $path_type)"
+        
+        # 使用临时目录确保一致性
+        local temp_dir="/tmp/rclone-backup-$$-$(date +%s)"
+        mkdir -p "$temp_dir"
+        
+        log_debug "Copying from local to temp: $local_path -> $temp_dir"
+        
+        # 根据类型复制
+        if [ "$path_type" = "file" ]; then
+            # 单个文件
+            log_debug "Detected file: $local_path"
+            if [ -f "$local_path" ]; then
+                cp "$local_path" "$temp_dir/"
+            else
+                log_warn "Path type mismatch: expected file, got directory: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+        else
+            # 目录
+            log_debug "Detected directory: $local_path"
+            if [ -d "$local_path" ]; then
+                # 复制目录内容（不包括目录本身）
+                if [ "$(ls -A $local_path 2>/dev/null)" ]; then
+                    cp -r "$local_path"/* "$temp_dir/" 2>/dev/null || true
+                    # 处理隐藏文件
+                    cp -r "$local_path"/.[!.]* "$temp_dir/" 2>/dev/null || true
+                fi
+            else
+                log_warn "Path type mismatch: expected directory, got file: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+        fi
+        
+        log_debug "Syncing from temp to cloud: $temp_dir -> $remote_path"
+        
+        # 执行 rclone sync（临时目录 -> 云端）
+        if rclone sync "$temp_dir" "$remote_path" \
+            ${RCLONE_FLAGS} \
+            --log-level INFO 2>&1 | grep -v "^20" || true; then
+            log_info "Backup success: $src_dir"
+        else
+            log_error "Backup failed: $src_dir (will retry next cycle)"
+        fi
+        
+        # 清理临时目录
+        rm -rf "$temp_dir"
+    done
+    
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    log_info "Backup complete (${elapsed}s)"
+}
 
-        if [ -e "$LOCAL_PATH" ]; then
-            mkdir -p "$(dirname "$REMOTE_FULL")"
-            rm -rf "$REMOTE_FULL"
-            cp -r "$LOCAL_PATH" "$REMOTE_FULL"
-            # [备份] 穿隐身衣 (处理嵌套Git)
-            if [ -d "$REMOTE_FULL" ]; then
-                 find "$REMOTE_FULL" -name ".git" -type d -prune -exec mv '{}' '{}_backup_cloak' \; 2>/dev/null || true
+# ==================== 5. 快照管理模块 ====================
+
+create_snapshot() {
+    if [ "$SNAPSHOT_ENABLED" != "true" ]; then
+        return
+    fi
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local snapshot_base="${REMOTE_NAME}:${BASE_DIR}/snapshots/${timestamp}"
+    
+    log_info ">>> Creating snapshot: $timestamp"
+    local start_time=$(date +%s)
+    
+    # 解析 SYNC_MAP
+    IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
+    
+    for MAPPING in "${MAPPINGS[@]}"; do
+        # 跳过空映射
+        if [ -z "$MAPPING" ]; then
+            continue
+        fi
+        
+        # 解析映射
+        SRC_DIR=$(echo "$MAPPING" | cut -d':' -f1)
+        LOCAL_PATH=$(echo "$MAPPING" | cut -d':' -f2)
+        SNAPSHOT_PATH="${snapshot_base}/${SRC_DIR}"
+        
+        # 检查本地路径是否存在
+        if [ ! -e "$LOCAL_PATH" ]; then
+            log_debug "Local path not found, skipping snapshot: $LOCAL_PATH"
+            continue
+        fi
+        
+        log_debug "Snapshotting: $LOCAL_PATH -> $SNAPSHOT_PATH"
+        
+        # 使用 rclone copy（而非 sync）保留历史版本
+        if rclone copy "$LOCAL_PATH" "$SNAPSHOT_PATH" \
+            ${RCLONE_FLAGS} \
+            --log-level ERROR 2>&1 | grep -v "^20" || true; then
+            log_debug "Snapshot success: $SRC_DIR"
+        else
+            log_error "Snapshot failed: $SRC_DIR"
+        fi
+    done
+    
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    log_info "Snapshot complete (${elapsed}s)"
+    
+    # 清理旧快照
+    cleanup_snapshots
+}
+
+cleanup_snapshots() {
+    log_debug ">>> Cleaning up old snapshots..."
+    
+    local snapshots_base="${REMOTE_NAME}:${BASE_DIR}/snapshots"
+    
+    # 获取所有快照列表（按时间排序，最新的在前）
+    local snapshots=$(rclone lsf "$snapshots_base" --dirs-only 2>/dev/null | sort -r || echo "")
+    
+    if [ -z "$snapshots" ]; then
+        log_debug "No snapshots found"
+        return
+    fi
+    
+    # 保留最近 N 个快照
+    local keep_list=""
+    local count=0
+    
+    for snapshot in $snapshots; do
+        if [ $count -lt $SNAPSHOT_KEEP_RECENT ]; then
+            keep_list="$keep_list $snapshot"
+            count=$((count + 1))
+        fi
+    done
+    
+    # 保留最近 N 天的每日快照（每天保留最早的一个）
+    local cutoff_date=$(date -d "$SNAPSHOT_KEEP_DAYS days ago" +%Y%m%d 2>/dev/null || date -v-${SNAPSHOT_KEEP_DAYS}d +%Y%m%d 2>/dev/null || echo "19700101")
+    local daily_snapshots=$(echo "$snapshots" | grep -E "^[0-9]{8}_" | cut -d'_' -f1 | sort -u || echo "")
+    
+    for day in $daily_snapshots; do
+        if [ "$day" -ge "$cutoff_date" ]; then
+            # 找到该天最早的快照（列表已按时间倒序，所以取最后一个）
+            local first_of_day=$(echo "$snapshots" | grep "^${day}_" | tail -n1)
+            if [ -n "$first_of_day" ]; then
+                keep_list="$keep_list $first_of_day"
             fi
         fi
     done
-
-    cd "$GIT_STORE" || return
     
-    # 检查变更
-    if [ -n "$(git status --porcelain)" ]; then
-        echo "[GitWrapper] Syncing..."
-        git add .
-        git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')" > /dev/null
-    else
-        echo "[GitWrapper] Skip Sync"
-        return # 无变更不检查截断
-    fi
-
-    # ==================== 🚨 全量截断逻辑 (History Reset) ====================
-    COMMIT_COUNT=$(git rev-list --count HEAD)
-
-    echo "[GitWrapper] [RESET] Count $COMMIT_COUNT, $HISTORY_LIMIT."
-    
-    if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
-        echo "[GitWrapper] [RESET] Count $COMMIT_COUNT > $HISTORY_LIMIT. Resetting history to 1 commit..."
-        
-        CURRENT_BRANCH=$(git branch --show-current)
-        
-        # 1. 孤儿分支: 抛弃父节点，保留文件
-        git checkout --orphan temp_reset_branch > /dev/null 2>&1
-        
-        # 2. 重新提交所有文件
-        git add -A
-        git commit -m "Reset History: Snapshot at $(date '+%Y-%m-%d %H:%M:%S')" > /dev/null
-        
-        # 3. 替换旧分支
-        git branch -D "$CURRENT_BRANCH" > /dev/null 2>&1
-        git branch -m "$CURRENT_BRANCH"
-        
-        # 4. 强推覆盖
-        echo "[GitWrapper] Force pushing new snapshot..."
-        if git push -f origin "$CURRENT_BRANCH" > /dev/null 2>&1; then
-             echo "[GitWrapper] [SUCCESS] History reset complete."
-        else
-             echo "[GitWrapper] [ERROR] Force push failed."
+    # 删除不在保留列表中的快照
+    for snapshot in $snapshots; do
+        if ! echo "$keep_list" | grep -q "$snapshot"; then
+            log_info "Deleting old snapshot: $snapshot"
+            rclone purge "${snapshots_base}/${snapshot}" --log-level ERROR 2>&1 | grep -v "^20" || true
         fi
-    else
-        # 正常推送
-        git pull --rebase origin "$BRANCH" > /dev/null 2>&1 || true
-        git push origin "$BRANCH" > /dev/null 2>&1
-    fi
+    done
+    
+    log_debug "Snapshot cleanup complete"
 }
 
-# ==================== 3. 启动流程 ====================
-
-if init_config; then
-    # 配置成功，启用同步功能
-    restore_data
-
-    (
-        while true; do
-            sleep "$INTERVAL"
-            backup_data
-        done
-    ) &
-    SYNC_PID=$!
-else
-    # 配置失败，跳过同步功能
-    echo "[GitWrapper] [WARN] Sync functionality disabled due to configuration error"
-    echo "[GitWrapper] [INFO] Container will start normally without backup/restore"
-    SYNC_PID=""
-fi
+# ==================== 6. 信号处理和优雅关闭 ====================
 
 shutdown_handler() {
-    echo "[GitWrapper] !!! Shutting down..."
-    if kill -0 "$APP_PID" 2>/dev/null; then
-        kill -SIGTERM "$APP_PID"
-        wait "$APP_PID"
+    log_info "!!! Shutting down..."
+    
+    # 1. 停止主应用进程
+    if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+        log_info "Stopping main app (PID: $APP_PID)"
+        kill -SIGTERM "$APP_PID" 2>/dev/null || true
+        
+        # 等待最多 30 秒
+        local timeout=30
+        while [ $timeout -gt 0 ] && kill -0 "$APP_PID" 2>/dev/null; do
+            sleep 1
+            timeout=$((timeout - 1))
+        done
+        
+        # 强制杀死
+        if kill -0 "$APP_PID" 2>/dev/null; then
+            log_warn "Force killing app (timeout)"
+            kill -SIGKILL "$APP_PID" 2>/dev/null || true
+        fi
     fi
-    if [ -n "$SYNC_PID" ]; then
-        kill -SIGTERM "$SYNC_PID" 2>/dev/null
-        backup_data
+    
+    # 2. 停止后台进程
+    if [ -n "$BACKUP_PID" ]; then
+        kill -SIGTERM "$BACKUP_PID" 2>/dev/null || true
     fi
+    
+    if [ -n "$SNAPSHOT_PID" ]; then
+        kill -SIGTERM "$SNAPSHOT_PID" 2>/dev/null || true
+    fi
+    
+    # 3. 最后一次强制备份
+    log_info "Performing final backup..."
+    backup_data
+    
+    log_info "Shutdown complete"
     exit 0
 }
-trap 'shutdown_handler' SIGTERM SIGINT
 
-# ==================== 4. 显微镜启动 ====================
+# ==================== 7. 主应用启动模块 ====================
 
-echo "[GitWrapper] >>> Starting App..."
-echo "[GitWrapper] [DEBUG] WorkDir:    '$ORIGINAL_WORKDIR'"
-echo "[GitWrapper] [DEBUG] CMD:        '$ORIGINAL_CMD'"
-
-if [ -n "$ORIGINAL_WORKDIR" ]; then
-    cd "$ORIGINAL_WORKDIR" || cd /
-else
-    cd /
-fi
-
-if [ -n "$*" ]; then
-    FINAL_ARGS="$*"
-else
-    FINAL_ARGS="$ORIGINAL_CMD"
-fi
-
-if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-    CMD_STR="$ORIGINAL_ENTRYPOINT $FINAL_ARGS"
-else
-    CMD_STR="$FINAL_ARGS"
-fi
-
-if [ -z "$CMD_STR" ]; then
-    echo "[GitWrapper] [FATAL] No command specified!"
-    exit 1
-fi
-
-echo "[GitWrapper] [DEBUG] Executing: $CMD_STR"
-
-set -m
-$CMD_STR 2>&1 &
-APP_PID=$!
-
-echo "[GitWrapper] [DEBUG] PID: $APP_PID"
-sleep 3
-
-if ! kill -0 "$APP_PID" 2>/dev/null; then
-    echo "[GitWrapper] [FATAL] App died immediately!"
+start_main_app() {
+    log_info ">>> Starting main app..."
+    
+    # 切换到原始工作目录
+    if [ -n "$ORIGINAL_WORKDIR" ]; then
+        log_debug "Changing to workdir: $ORIGINAL_WORKDIR"
+        cd "$ORIGINAL_WORKDIR" || cd /
+    else
+        cd /
+    fi
+    
+    # 构造命令
+    local final_args=""
+    if [ -n "$*" ]; then
+        final_args="$*"
+    else
+        final_args="$ORIGINAL_CMD"
+    fi
+    
+    local cmd_str=""
+    if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+        cmd_str="$ORIGINAL_ENTRYPOINT $final_args"
+    else
+        cmd_str="$final_args"
+    fi
+    
+    if [ -z "$cmd_str" ]; then
+        log_error "No command specified (ENTRYPOINT and CMD are both empty)"
+        exit 1
+    fi
+    
+    log_debug "WorkDir: $ORIGINAL_WORKDIR"
+    log_debug "Entrypoint: $ORIGINAL_ENTRYPOINT"
+    log_debug "CMD: $ORIGINAL_CMD"
+    log_debug "Executing: $cmd_str"
+    
+    # 启动主应用（前台进程）
+    set -m
+    $cmd_str 2>&1 &
+    APP_PID=$!
+    
+    log_debug "App PID: $APP_PID"
+    
+    # 验证启动成功（等待 3 秒）
+    sleep 3
+    
+    if ! kill -0 "$APP_PID" 2>/dev/null; then
+        log_error "App died immediately after start"
+        wait "$APP_PID" 2>/dev/null || true
+        local exit_code=$?
+        log_error "App exit code: $exit_code"
+        exit $exit_code
+    fi
+    
+    log_info "App is running (PID: $APP_PID)"
+    
+    # 等待主应用退出
     wait "$APP_PID"
-    EXIT_CODE=$?
-    echo "[GitWrapper] [FATAL] Exit Code: $EXIT_CODE"
-    exit $EXIT_CODE
-else
-    echo "[GitWrapper] [SUCCESS] App is running."
-fi
+}
 
-wait "$APP_PID"
+# ==================== 8. 主流程 ====================
+
+main() {
+    log_info "========================================="
+    log_info "  Rclone Wrapper Starting"
+    log_info "========================================="
+    
+    # 1. 初始化配置
+    if init_config; then
+        # 配置成功，启用同步功能
+        
+        # 2. 恢复数据
+        restore_data
+        
+        # 3. 注册信号处理器
+        trap 'shutdown_handler' SIGTERM SIGINT
+        
+        # 4. 启动后台备份循环
+        (
+            while true; do
+                sleep "$INTERVAL"
+                backup_data
+            done
+        ) &
+        BACKUP_PID=$!
+        log_info "Backup loop started (PID: $BACKUP_PID, interval: ${INTERVAL}s)"
+        
+        # 5. 启动后台快照循环（如果启用）
+        if [ "$SNAPSHOT_ENABLED" = "true" ]; then
+            (
+                while true; do
+                    sleep "$SNAPSHOT_INTERVAL"
+                    create_snapshot
+                done
+            ) &
+            SNAPSHOT_PID=$!
+            log_info "Snapshot loop started (PID: $SNAPSHOT_PID, interval: ${SNAPSHOT_INTERVAL}s)"
+        fi
+    else
+        # 配置失败，跳过同步功能，仅启动主应用
+        log_warn "Sync functionality disabled due to configuration error"
+        log_info "Container will start normally without backup/restore"
+    fi
+    
+    # 6. 启动主应用（前台，会阻塞直到应用退出）
+    start_main_app "$@"
+}
+
+# 执行主流程
+main "$@"
+
