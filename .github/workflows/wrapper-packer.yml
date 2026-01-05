@@ -1,0 +1,78 @@
+name: 🏭 Wrap Image (Auto-Detect)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base Image (e.g., python:3.9, nginx:alpine)'
+        required: true
+        default: 'nginx:alpine'
+      target_tag:
+        description: 'Target Tag Name'
+        required: true
+        default: 'app-rclone-sync'
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # === 侦探模式：全量探测原镜像配置 ===
+      - name: 🕵️ Detect Original Config
+        id: detect
+        run: |
+          docker pull ${{ inputs.base_image }}
+          
+          # 1. 抓取 Entrypoint (数组转字符串)
+          EP=$(docker inspect --format='{{range .Config.Entrypoint}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          
+          # 2. 抓取 CMD (关键：防止 python app.py 丢失)
+          CMD=$(docker inspect --format='{{range .Config.Cmd}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          
+          # 3. 抓取 WorkDir (关键：防止路径错误)
+          WD=$(docker inspect --format='{{.Config.WorkingDir}}' ${{ inputs.base_image }})
+          # 如果为空，默认为根目录
+          if [ -z "$WD" ]; then WD="/"; fi
+          
+          echo "entrypoint=$EP" >> $GITHUB_OUTPUT
+          echo "cmd=$CMD" >> $GITHUB_OUTPUT
+          echo "workdir=$WD" >> $GITHUB_OUTPUT
+          
+          echo "----------------------------------------"
+          echo "Detected Entrypoint: [$EP]"
+          echo "Detected CMD:        [$CMD]"
+          echo "Detected WorkDir:    [$WD]"
+          echo "----------------------------------------"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          # === 注入所有探测到的参数 ===
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+            ORIGINAL_ENTRYPOINT=${{ steps.detect.outputs.entrypoint }}
+            ORIGINAL_CMD=${{ steps.detect.outputs.cmd }}
+            ORIGINAL_WORKDIR=${{ steps.detect.outputs.workdir }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}:latest
