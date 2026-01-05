@@ -15,12 +15,6 @@ RCLONE_FLAGS="${RW_RCLONE_FLAGS:-}"
 
 # 默认 rclone 优化参数（如果用户未指定）
 if [ -z "$RCLONE_FLAGS" ]; then
-    # 设置合理的默认值：
-    # --transfers=4: 并发传输 4 个文件（平衡速度和资源）
-    # --checkers=8: 并发检查 8 个文件
-    # --contimeout=60s: 连接超时 60 秒
-    # --timeout=300s: 传输超时 5 分钟
-    # --retries=3: 失败重试 3 次
     RCLONE_FLAGS="--transfers=4 --checkers=8 --contimeout=60s --timeout=300s --retries=3"
 fi
 
@@ -68,7 +62,6 @@ log_debug() {
 init_config() {
     log_info ">>> Initializing configuration..."
     
-    # 验证必填环境变量
     if [ -z "$RCLONE_CONFIG_B64" ] || [ -z "$BASE_DIR" ] || [ -z "$SYNC_MAP" ]; then
         log_error "Missing required environment variables!"
         log_error "Required: RW_RCLONE_CONFIG, RW_BASE_DIR, RW_SYNC_MAP"
@@ -76,7 +69,6 @@ init_config() {
         return 1
     fi
     
-    # 解码并写入 rclone 配置
     mkdir -p /root/.config/rclone
     if ! echo "$RCLONE_CONFIG_B64" | base64 -d > /root/.config/rclone/rclone.conf 2>/dev/null; then
         log_error "Failed to decode RW_RCLONE_CONFIG (invalid BASE64)"
@@ -86,20 +78,17 @@ init_config() {
     
     log_debug "Rclone config written to /root/.config/rclone/rclone.conf"
     
-    # 验证 rclone 配置有效性
     if ! rclone listremotes > /dev/null 2>&1; then
         log_error "Invalid rclone configuration (rclone listremotes failed)"
         log_warn "Wrapper will start container without sync functionality"
         return 1
     fi
     
-    # 确定 REMOTE_NAME
     if [ -z "$REMOTE_NAME" ]; then
         REMOTE_NAME=$(rclone listremotes | head -n1 | tr -d ':')
         log_info "Auto-detected remote: $REMOTE_NAME"
     fi
     
-    # 输出配置摘要（脱敏）
     log_info "Configuration Summary:"
     log_info "  Remote: $REMOTE_NAME"
     log_info "  Base Dir: $BASE_DIR"
@@ -117,40 +106,31 @@ init_config() {
     return 0
 }
 
-# ==================== 3. 数据恢复模块 ====================
+# ==================== 3. 数据恢复模块（ZIP 方式）====================
 
 restore_data() {
     log_info ">>> Restoring data from cloud storage..."
     local start_time=$(date +%s)
     
-    # 解析 SYNC_MAP: 
-    # 格式1: dir:src_dir:/container/path (明确指定类型)
-    # 格式2: file:src_dir:/container/path (明确指定类型)
-    # 格式3: src_dir:/container/path (自动判断)
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     
     for MAPPING in "${MAPPINGS[@]}"; do
-        # 跳过空映射
         if [ -z "$MAPPING" ]; then
             continue
         fi
         
-        # 解析映射
         IFS=':' read -ra PARTS <<< "$MAPPING"
         local path_type=""
         local src_dir=""
         local local_path=""
         
         if [ ${#PARTS[@]} -eq 3 ]; then
-            # 格式: type:src_dir:local_path
             path_type="${PARTS[0]}"
             src_dir="${PARTS[1]}"
             local_path="${PARTS[2]}"
         elif [ ${#PARTS[@]} -eq 2 ]; then
-            # 格式: src_dir:local_path (需要自动判断)
             src_dir="${PARTS[0]}"
             local_path="${PARTS[1]}"
-            # 通过扩展名猜测
             if [[ "$local_path" =~ \.[a-zA-Z0-9]+$ ]]; then
                 path_type="file"
             else
@@ -161,75 +141,49 @@ restore_data() {
             continue
         fi
         
-        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
+        local remote_zip="${REMOTE_NAME}:${BASE_DIR}/${src_dir}.zip"
         
-        log_info "Restoring: $remote_path -> $local_path (type: $path_type)"
+        log_info "Restoring: $remote_zip -> $local_path (type: $path_type)"
         
-        # 检查远程路径是否存在
-        if ! rclone lsf "$remote_path" > /dev/null 2>&1; then
-            log_warn "Remote path not found (new container init): $remote_path"
+        if ! rclone lsf "$remote_zip" > /dev/null 2>&1; then
+            log_warn "Remote zip not found (new container init): $remote_zip"
             
-            # 根据类型决定是否创建本地路径
-            if [ "$path_type" = "dir" ] || [ "$path_type" = "auto" ]; then
-                # 目录类型：预先创建，防止应用写入时报错（类似 Docker 挂载）
+            if [ "$path_type" = "dir" ]; then
                 log_info "Creating directory for app: $local_path"
                 mkdir -p "$local_path"
             else
-                # 文件类型：跳过，不创建文件
                 log_info "Skipping file creation, let app initialize: $local_path"
             fi
             
             continue
         fi
         
-        # 如果远程存在，用远程判断类型（覆盖猜测）
-        # 使用 rclone lsd 检查远程路径本身是否是目录
-        if rclone lsd "$(dirname "$remote_path")" 2>/dev/null | grep -q "$(basename "$remote_path")"; then
-            # 远程路径本身是一个目录
-            path_type="dir"
-            log_debug "Remote detected as directory"
-        else
-            # 远程路径是一个文件
-            path_type="file"
-            log_debug "Remote detected as file"
-        fi
-        
-        # 删除本地旧数据
         log_debug "Removing old local data: $local_path"
         rm -rf "$local_path"
         
-        # 创建父目录
         mkdir -p "$(dirname "$local_path")"
         
-        # 使用临时目录确保一致性
         local temp_dir="/tmp/rclone-restore-$$-$(date +%s)"
         mkdir -p "$temp_dir"
         
-        log_debug "Syncing from cloud to temp: $remote_path -> $temp_dir"
-        if rclone sync "$remote_path" "$temp_dir" \
-            --exclude "snapshots/**" \
+        log_debug "Downloading zip from cloud: $remote_zip -> $temp_dir/data.zip"
+        if rclone copyto "$remote_zip" "$temp_dir/data.zip" \
             ${RCLONE_FLAGS} \
             --log-level INFO 2>&1 | grep -v "^20" || true; then
             
-            # 同步成功，根据类型复制到目标位置
-            log_debug "Copying from temp to target: $temp_dir -> $local_path (type: $path_type)"
+            log_debug "Extracting zip: $temp_dir/data.zip"
             
             if [ "$path_type" = "file" ]; then
-                # 单文件：复制第一个文件
-                local first_file=$(find "$temp_dir" -type f | head -n1)
+                unzip -q "$temp_dir/data.zip" -d "$temp_dir/extract" 2>/dev/null || true
+                local first_file=$(find "$temp_dir/extract" -type f | head -n1)
                 if [ -n "$first_file" ]; then
                     cp "$first_file" "$local_path"
                 fi
             else
-                # 目录：创建目录并复制内容
                 mkdir -p "$local_path"
-                if [ "$(ls -A $temp_dir 2>/dev/null)" ]; then
-                    cp -r "$temp_dir"/* "$local_path/" 2>/dev/null || true
-                    cp -r "$temp_dir"/.[!.]* "$local_path/" 2>/dev/null || true
-                fi
+                unzip -q "$temp_dir/data.zip" -d "$local_path" 2>/dev/null || true
             fi
             
-            # 清理临时目录
             rm -rf "$temp_dir"
             
             log_info "Restore success: $src_dir"
@@ -244,34 +198,29 @@ restore_data() {
     log_info "Restore complete (${elapsed}s)"
 }
 
-# ==================== 4. 数据备份模块 ====================
+# ==================== 4. 数据备份模块（ZIP 方式）====================
 
 backup_data() {
     log_info ">>> Backing up data to cloud storage..."
     local start_time=$(date +%s)
     
-    # 解析 SYNC_MAP
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     
     for MAPPING in "${MAPPINGS[@]}"; do
-        # 跳过空映射
         if [ -z "$MAPPING" ]; then
             continue
         fi
         
-        # 解析映射
         IFS=':' read -ra PARTS <<< "$MAPPING"
         local path_type=""
         local src_dir=""
         local local_path=""
         
         if [ ${#PARTS[@]} -eq 3 ]; then
-            # 格式: type:src_dir:local_path
             path_type="${PARTS[0]}"
             src_dir="${PARTS[1]}"
             local_path="${PARTS[2]}"
         elif [ ${#PARTS[@]} -eq 2 ]; then
-            # 格式: src_dir:local_path (需要自动判断)
             src_dir="${PARTS[0]}"
             local_path="${PARTS[1]}"
             path_type="auto"
@@ -280,15 +229,13 @@ backup_data() {
             continue
         fi
         
-        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
+        local remote_zip="${REMOTE_NAME}:${BASE_DIR}/${src_dir}.zip"
         
-        # 检查本地路径是否存在
         if [ ! -e "$local_path" ]; then
             log_warn "Local path not found, skipping: $local_path"
             continue
         fi
         
-        # 如果是 auto，根据本地路径判断类型
         if [ "$path_type" = "auto" ]; then
             if [ -f "$local_path" ]; then
                 path_type="file"
@@ -300,34 +247,26 @@ backup_data() {
             fi
         fi
         
-        log_info "Backing up: $local_path -> $remote_path (type: $path_type)"
+        log_info "Backing up: $local_path -> $remote_zip (type: $path_type)"
         
-        # 使用临时目录确保一致性
         local temp_dir="/tmp/rclone-backup-$$-$(date +%s)"
-        mkdir -p "$temp_dir"
+        mkdir -p "$temp_dir/staging"
         
-        log_debug "Copying from local to temp: $local_path -> $temp_dir"
+        log_debug "Copying to staging: $local_path -> $temp_dir/staging"
         
-        # 根据类型复制
         if [ "$path_type" = "file" ]; then
-            # 单个文件
-            log_debug "Detected file: $local_path"
             if [ -f "$local_path" ]; then
-                cp "$local_path" "$temp_dir/"
+                cp "$local_path" "$temp_dir/staging/"
             else
                 log_warn "Path type mismatch: expected file, got directory: $local_path"
                 rm -rf "$temp_dir"
                 continue
             fi
         else
-            # 目录
-            log_debug "Detected directory: $local_path"
             if [ -d "$local_path" ]; then
-                # 复制目录内容（不包括目录本身）
                 if [ "$(ls -A $local_path 2>/dev/null)" ]; then
-                    cp -r "$local_path"/* "$temp_dir/" 2>/dev/null || true
-                    # 处理隐藏文件
-                    cp -r "$local_path"/.[!.]* "$temp_dir/" 2>/dev/null || true
+                    cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null || true
+                    cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
                 fi
             else
                 log_warn "Path type mismatch: expected directory, got file: $local_path"
@@ -336,10 +275,12 @@ backup_data() {
             fi
         fi
         
-        log_debug "Syncing from temp to cloud: $temp_dir -> $remote_path"
+        log_debug "Creating zip archive: $temp_dir/staging -> $temp_dir/data.zip"
+        (cd "$temp_dir/staging" && zip -qr "$temp_dir/data.zip" . 2>/dev/null) || true
         
-        # 执行 rclone sync（临时目录 -> 云端）
-        if rclone sync "$temp_dir" "$remote_path" \
+        log_debug "Uploading zip to cloud: $temp_dir/data.zip -> $remote_zip"
+        
+        if rclone copyto "$temp_dir/data.zip" "$remote_zip" \
             ${RCLONE_FLAGS} \
             --log-level INFO 2>&1 | grep -v "^20" || true; then
             log_info "Backup success: $src_dir"
@@ -347,7 +288,6 @@ backup_data() {
             log_error "Backup failed: $src_dir (will retry next cycle)"
         fi
         
-        # 清理临时目录
         rm -rf "$temp_dir"
     done
     
@@ -356,7 +296,7 @@ backup_data() {
     log_info "Backup complete (${elapsed}s)"
 }
 
-# ==================== 5. 快照管理模块 ====================
+# ==================== 5. 快照管理模块（ZIP 方式）====================
 
 create_snapshot() {
     if [ "$SNAPSHOT_ENABLED" != "true" ]; then
@@ -364,48 +304,73 @@ create_snapshot() {
     fi
     
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local snapshot_base="${REMOTE_NAME}:${BASE_DIR}/snapshots/${timestamp}"
+    local snapshot_base="${REMOTE_NAME}:${BASE_DIR}/snapshots"
     
     log_info ">>> Creating snapshot: $timestamp"
     local start_time=$(date +%s)
     
-    # 解析 SYNC_MAP
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     
     for MAPPING in "${MAPPINGS[@]}"; do
-        # 跳过空映射
         if [ -z "$MAPPING" ]; then
             continue
         fi
         
-        # 解析映射
-        SRC_DIR=$(echo "$MAPPING" | cut -d':' -f1)
-        LOCAL_PATH=$(echo "$MAPPING" | cut -d':' -f2)
-        SNAPSHOT_PATH="${snapshot_base}/${SRC_DIR}"
+        IFS=':' read -ra PARTS <<< "$MAPPING"
+        local src_dir=""
+        local local_path=""
         
-        # 检查本地路径是否存在
-        if [ ! -e "$LOCAL_PATH" ]; then
-            log_debug "Local path not found, skipping snapshot: $LOCAL_PATH"
+        if [ ${#PARTS[@]} -eq 3 ]; then
+            src_dir="${PARTS[1]}"
+            local_path="${PARTS[2]}"
+        elif [ ${#PARTS[@]} -eq 2 ]; then
+            src_dir="${PARTS[0]}"
+            local_path="${PARTS[1]}"
+        else
             continue
         fi
         
-        log_debug "Snapshotting: $LOCAL_PATH -> $SNAPSHOT_PATH"
+        if [ ! -e "$local_path" ]; then
+            log_debug "Local path not found, skipping snapshot: $local_path"
+            continue
+        fi
         
-        # 使用 rclone copy（而非 sync）保留历史版本
-        if rclone copy "$LOCAL_PATH" "$SNAPSHOT_PATH" \
+        local snapshot_zip="${snapshot_base}/${timestamp}_${src_dir}.zip"
+        
+        log_debug "Snapshotting: $local_path -> $snapshot_zip"
+        
+        local temp_dir="/tmp/rclone-snapshot-$$-$(date +%s)"
+        mkdir -p "$temp_dir/staging"
+        
+        log_debug "Copying to staging: $local_path -> $temp_dir/staging"
+        
+        if [ -f "$local_path" ]; then
+            cp "$local_path" "$temp_dir/staging/"
+        elif [ -d "$local_path" ]; then
+            if [ "$(ls -A $local_path 2>/dev/null)" ]; then
+                cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null || true
+                cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
+            fi
+        fi
+        
+        log_debug "Creating zip archive: $temp_dir/staging -> $temp_dir/snapshot.zip"
+        (cd "$temp_dir/staging" && zip -qr "$temp_dir/snapshot.zip" . 2>/dev/null) || true
+        
+        if rclone copyto "$temp_dir/snapshot.zip" "$snapshot_zip" \
             ${RCLONE_FLAGS} \
             --log-level ERROR 2>&1 | grep -v "^20" || true; then
-            log_debug "Snapshot success: $SRC_DIR"
+            log_debug "Snapshot success: $src_dir"
         else
-            log_error "Snapshot failed: $SRC_DIR"
+            log_error "Snapshot failed: $src_dir"
         fi
+        
+        rm -rf "$temp_dir"
     done
     
     local end_time=$(date +%s)
     local elapsed=$((end_time - start_time))
     log_info "Snapshot complete (${elapsed}s)"
     
-    # 清理旧快照
     cleanup_snapshots
 }
 
@@ -414,15 +379,13 @@ cleanup_snapshots() {
     
     local snapshots_base="${REMOTE_NAME}:${BASE_DIR}/snapshots"
     
-    # 获取所有快照列表（按时间排序，最新的在前）
-    local snapshots=$(rclone lsf "$snapshots_base" --dirs-only 2>/dev/null | sort -r || echo "")
+    local snapshots=$(rclone lsf "$snapshots_base" --files-only 2>/dev/null | grep '\.zip$' | sort -r || echo "")
     
     if [ -z "$snapshots" ]; then
         log_debug "No snapshots found"
         return
     fi
     
-    # 保留最近 N 个快照
     local keep_list=""
     local count=0
     
@@ -433,13 +396,11 @@ cleanup_snapshots() {
         fi
     done
     
-    # 保留最近 N 天的每日快照（每天保留最早的一个）
     local cutoff_date=$(date -d "$SNAPSHOT_KEEP_DAYS days ago" +%Y%m%d 2>/dev/null || date -v-${SNAPSHOT_KEEP_DAYS}d +%Y%m%d 2>/dev/null || echo "19700101")
     local daily_snapshots=$(echo "$snapshots" | grep -E "^[0-9]{8}_" | cut -d'_' -f1 | sort -u || echo "")
     
     for day in $daily_snapshots; do
         if [ "$day" -ge "$cutoff_date" ]; then
-            # 找到该天最早的快照（列表已按时间倒序，所以取最后一个）
             local first_of_day=$(echo "$snapshots" | grep "^${day}_" | tail -n1)
             if [ -n "$first_of_day" ]; then
                 keep_list="$keep_list $first_of_day"
@@ -447,11 +408,10 @@ cleanup_snapshots() {
         fi
     done
     
-    # 删除不在保留列表中的快照
     for snapshot in $snapshots; do
         if ! echo "$keep_list" | grep -q "$snapshot"; then
             log_info "Deleting old snapshot: $snapshot"
-            rclone purge "${snapshots_base}/${snapshot}" --log-level ERROR 2>&1 | grep -v "^20" || true
+            rclone deletefile "${snapshots_base}/${snapshot}" --log-level ERROR 2>&1 | grep -v "^20" || true
         fi
     done
     
@@ -463,26 +423,22 @@ cleanup_snapshots() {
 shutdown_handler() {
     log_info "!!! Shutting down..."
     
-    # 1. 停止主应用进程
     if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
         log_info "Stopping main app (PID: $APP_PID)"
         kill -SIGTERM "$APP_PID" 2>/dev/null || true
         
-        # 等待最多 30 秒
         local timeout=30
         while [ $timeout -gt 0 ] && kill -0 "$APP_PID" 2>/dev/null; do
             sleep 1
             timeout=$((timeout - 1))
         done
         
-        # 强制杀死
         if kill -0 "$APP_PID" 2>/dev/null; then
             log_warn "Force killing app (timeout)"
             kill -SIGKILL "$APP_PID" 2>/dev/null || true
         fi
     fi
     
-    # 2. 停止后台进程
     if [ -n "$BACKUP_PID" ]; then
         kill -SIGTERM "$BACKUP_PID" 2>/dev/null || true
     fi
@@ -491,7 +447,6 @@ shutdown_handler() {
         kill -SIGTERM "$SNAPSHOT_PID" 2>/dev/null || true
     fi
     
-    # 3. 最后一次强制备份
     log_info "Performing final backup..."
     backup_data
     
@@ -504,7 +459,6 @@ shutdown_handler() {
 start_main_app() {
     log_info ">>> Starting main app..."
     
-    # 切换到原始工作目录
     if [ -n "$ORIGINAL_WORKDIR" ]; then
         log_debug "Changing to workdir: $ORIGINAL_WORKDIR"
         cd "$ORIGINAL_WORKDIR" || cd /
@@ -512,7 +466,6 @@ start_main_app() {
         cd /
     fi
     
-    # 构造命令
     local final_args=""
     if [ -n "$*" ]; then
         final_args="$*"
@@ -537,14 +490,12 @@ start_main_app() {
     log_debug "CMD: $ORIGINAL_CMD"
     log_debug "Executing: $cmd_str"
     
-    # 启动主应用（前台进程）
     set -m
     $cmd_str 2>&1 &
     APP_PID=$!
     
     log_debug "App PID: $APP_PID"
     
-    # 验证启动成功（等待 3 秒）
     sleep 3
     
     if ! kill -0 "$APP_PID" 2>/dev/null; then
@@ -557,7 +508,6 @@ start_main_app() {
     
     log_info "App is running (PID: $APP_PID)"
     
-    # 等待主应用退出
     wait "$APP_PID"
 }
 
@@ -568,17 +518,11 @@ main() {
     log_info "  Rclone Wrapper Starting"
     log_info "========================================="
     
-    # 1. 初始化配置
     if init_config; then
-        # 配置成功，启用同步功能
-        
-        # 2. 恢复数据
         restore_data
         
-        # 3. 注册信号处理器
         trap 'shutdown_handler' SIGTERM SIGINT
         
-        # 4. 启动后台备份循环
         (
             while true; do
                 sleep "$INTERVAL"
@@ -588,7 +532,6 @@ main() {
         BACKUP_PID=$!
         log_info "Backup loop started (PID: $BACKUP_PID, interval: ${INTERVAL}s)"
         
-        # 5. 启动后台快照循环（如果启用）
         if [ "$SNAPSHOT_ENABLED" = "true" ]; then
             (
                 while true; do
@@ -600,15 +543,11 @@ main() {
             log_info "Snapshot loop started (PID: $SNAPSHOT_PID, interval: ${SNAPSHOT_INTERVAL}s)"
         fi
     else
-        # 配置失败，跳过同步功能，仅启动主应用
         log_warn "Sync functionality disabled due to configuration error"
         log_info "Container will start normally without backup/restore"
     fi
     
-    # 6. 启动主应用（前台，会阻塞直到应用退出）
     start_main_app "$@"
 }
 
-# 执行主流程
 main "$@"
-
