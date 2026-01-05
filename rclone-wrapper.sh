@@ -22,7 +22,6 @@ if [ -z "$RCLONE_FLAGS" ]; then
     # --timeout=300s: 传输超时 5 分钟
     # --retries=3: 失败重试 3 次
     RCLONE_FLAGS="--transfers=4 --checkers=8 --contimeout=60s --timeout=300s --retries=3"
-    log_debug "Using default rclone flags: $RCLONE_FLAGS"
 fi
 
 # 快照配置
@@ -73,14 +72,16 @@ init_config() {
     if [ -z "$RCLONE_CONFIG_B64" ] || [ -z "$BASE_DIR" ] || [ -z "$SYNC_MAP" ]; then
         log_error "Missing required environment variables!"
         log_error "Required: RW_RCLONE_CONFIG, RW_BASE_DIR, RW_SYNC_MAP"
-        exit 1
+        log_warn "Wrapper will start container without sync functionality"
+        return 1
     fi
     
     # 解码并写入 rclone 配置
     mkdir -p /root/.config/rclone
     if ! echo "$RCLONE_CONFIG_B64" | base64 -d > /root/.config/rclone/rclone.conf 2>/dev/null; then
         log_error "Failed to decode RW_RCLONE_CONFIG (invalid BASE64)"
-        exit 1
+        log_warn "Wrapper will start container without sync functionality"
+        return 1
     fi
     
     log_debug "Rclone config written to /root/.config/rclone/rclone.conf"
@@ -88,7 +89,8 @@ init_config() {
     # 验证 rclone 配置有效性
     if ! rclone listremotes > /dev/null 2>&1; then
         log_error "Invalid rclone configuration (rclone listremotes failed)"
-        exit 1
+        log_warn "Wrapper will start container without sync functionality"
+        return 1
     fi
     
     # 确定 REMOTE_NAME
@@ -112,6 +114,7 @@ init_config() {
     log_info "  Rclone Config Length: ${#RCLONE_CONFIG_B64} chars (BASE64)"
     
     log_info "Configuration initialized successfully"
+    return 0
 }
 
 # ==================== 3. 数据恢复模块 ====================
@@ -120,7 +123,10 @@ restore_data() {
     log_info ">>> Restoring data from cloud storage..."
     local start_time=$(date +%s)
     
-    # 解析 SYNC_MAP: src_dir1:/container/path1;src_dir2:/container/path2
+    # 解析 SYNC_MAP: 
+    # 格式1: dir:src_dir:/container/path (明确指定类型)
+    # 格式2: file:src_dir:/container/path (明确指定类型)
+    # 格式3: src_dir:/container/path (自动判断)
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     
     for MAPPING in "${MAPPINGS[@]}"; do
@@ -129,35 +135,109 @@ restore_data() {
             continue
         fi
         
-        # 解析映射：src_dir:/container/path
-        SRC_DIR=$(echo "$MAPPING" | cut -d':' -f1)
-        LOCAL_PATH=$(echo "$MAPPING" | cut -d':' -f2)
-        REMOTE_PATH="${REMOTE_NAME}:${BASE_DIR}/${SRC_DIR}"
+        # 解析映射
+        IFS=':' read -ra PARTS <<< "$MAPPING"
+        local path_type=""
+        local src_dir=""
+        local local_path=""
         
-        log_info "Restoring: $REMOTE_PATH -> $LOCAL_PATH"
-        
-        # 检查远程路径是否存在
-        if ! rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-            log_warn "Remote path not found (new container init): $REMOTE_PATH"
-            log_info "Creating empty directory: $LOCAL_PATH"
-            mkdir -p "$LOCAL_PATH"
+        if [ ${#PARTS[@]} -eq 3 ]; then
+            # 格式: type:src_dir:local_path
+            path_type="${PARTS[0]}"
+            src_dir="${PARTS[1]}"
+            local_path="${PARTS[2]}"
+        elif [ ${#PARTS[@]} -eq 2 ]; then
+            # 格式: src_dir:local_path (需要自动判断)
+            src_dir="${PARTS[0]}"
+            local_path="${PARTS[1]}"
+            # 通过扩展名猜测
+            if [[ "$local_path" =~ \.[a-zA-Z0-9]+$ ]]; then
+                path_type="file"
+            else
+                path_type="dir"
+            fi
+        else
+            log_error "Invalid SYNC_MAP format: $MAPPING"
             continue
         fi
         
-        # 删除本地旧数据并创建新目录
-        log_debug "Removing old local data: $LOCAL_PATH"
-        rm -rf "$LOCAL_PATH"
-        mkdir -p "$LOCAL_PATH"
+        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
         
-        # 执行 rclone sync（云端 -> 本地），排除快照目录
-        log_debug "Syncing from cloud to local..."
-        if rclone sync "$REMOTE_PATH" "$LOCAL_PATH" \
+        log_info "Restoring: $remote_path -> $local_path (type: $path_type)"
+        
+        # 检查远程路径是否存在
+        if ! rclone lsf "$remote_path" > /dev/null 2>&1; then
+            log_warn "Remote path not found (new container init): $remote_path"
+            
+            # 根据类型决定是否创建本地路径
+            if [ "$path_type" = "dir" ] || [ "$path_type" = "auto" ]; then
+                # 目录类型：预先创建，防止应用写入时报错（类似 Docker 挂载）
+                log_info "Creating directory for app: $local_path"
+                mkdir -p "$local_path"
+            else
+                # 文件类型：跳过，不创建文件
+                log_info "Skipping file creation, let app initialize: $local_path"
+            fi
+            
+            continue
+        fi
+        
+        # 如果远程存在，用远程判断类型（覆盖猜测）
+        local remote_files=$(rclone lsf "$remote_path" 2>/dev/null)
+        local remote_file_count=$(echo "$remote_files" | grep -v '^$' | wc -l)
+        
+        if [ "$remote_file_count" -eq 1 ] && ! echo "$remote_files" | grep -q '/$'; then
+            # 远程只有一个文件（不是目录）
+            path_type="file"
+            log_debug "Remote detected as file"
+        elif [ "$remote_file_count" -gt 0 ]; then
+            # 远程有多个文件或目录
+            path_type="dir"
+            log_debug "Remote detected as directory"
+        fi
+        
+        # 删除本地旧数据
+        log_debug "Removing old local data: $local_path"
+        rm -rf "$local_path"
+        
+        # 创建父目录
+        mkdir -p "$(dirname "$local_path")"
+        
+        # 使用临时目录确保一致性
+        local temp_dir="/tmp/rclone-restore-$$-$(date +%s)"
+        mkdir -p "$temp_dir"
+        
+        log_debug "Syncing from cloud to temp: $remote_path -> $temp_dir"
+        if rclone sync "$remote_path" "$temp_dir" \
             --exclude "snapshots/**" \
             ${RCLONE_FLAGS} \
             --log-level INFO 2>&1 | grep -v "^20" || true; then
-            log_info "Restore success: $SRC_DIR"
+            
+            # 同步成功，根据类型复制到目标位置
+            log_debug "Copying from temp to target: $temp_dir -> $local_path (type: $path_type)"
+            
+            if [ "$path_type" = "file" ]; then
+                # 单文件：复制第一个文件
+                local first_file=$(find "$temp_dir" -type f | head -n1)
+                if [ -n "$first_file" ]; then
+                    cp "$first_file" "$local_path"
+                fi
+            else
+                # 目录：创建目录并复制内容
+                mkdir -p "$local_path"
+                if [ "$(ls -A $temp_dir 2>/dev/null)" ]; then
+                    cp -r "$temp_dir"/* "$local_path/" 2>/dev/null || true
+                    cp -r "$temp_dir"/.[!.]* "$local_path/" 2>/dev/null || true
+                fi
+            fi
+            
+            # 清理临时目录
+            rm -rf "$temp_dir"
+            
+            log_info "Restore success: $src_dir"
         else
-            log_error "Restore failed: $SRC_DIR (continuing anyway)"
+            log_error "Restore failed: $src_dir (continuing anyway)"
+            rm -rf "$temp_dir"
         fi
     done
     
@@ -182,27 +262,95 @@ backup_data() {
         fi
         
         # 解析映射
-        SRC_DIR=$(echo "$MAPPING" | cut -d':' -f1)
-        LOCAL_PATH=$(echo "$MAPPING" | cut -d':' -f2)
-        REMOTE_PATH="${REMOTE_NAME}:${BASE_DIR}/${SRC_DIR}"
+        IFS=':' read -ra PARTS <<< "$MAPPING"
+        local path_type=""
+        local src_dir=""
+        local local_path=""
         
-        # 检查本地路径是否存在
-        if [ ! -e "$LOCAL_PATH" ]; then
-            log_warn "Local path not found, skipping: $LOCAL_PATH"
+        if [ ${#PARTS[@]} -eq 3 ]; then
+            # 格式: type:src_dir:local_path
+            path_type="${PARTS[0]}"
+            src_dir="${PARTS[1]}"
+            local_path="${PARTS[2]}"
+        elif [ ${#PARTS[@]} -eq 2 ]; then
+            # 格式: src_dir:local_path (需要自动判断)
+            src_dir="${PARTS[0]}"
+            local_path="${PARTS[1]}"
+            path_type="auto"
+        else
+            log_error "Invalid SYNC_MAP format: $MAPPING"
             continue
         fi
         
-        log_info "Backing up: $LOCAL_PATH -> $REMOTE_PATH"
+        local remote_path="${REMOTE_NAME}:${BASE_DIR}/${src_dir}"
         
-        # 执行 rclone sync（本地 -> 云端）
-        log_debug "Syncing from local to cloud..."
-        if rclone sync "$LOCAL_PATH" "$REMOTE_PATH" \
+        # 检查本地路径是否存在
+        if [ ! -e "$local_path" ]; then
+            log_warn "Local path not found, skipping: $local_path"
+            continue
+        fi
+        
+        # 如果是 auto，根据本地路径判断类型
+        if [ "$path_type" = "auto" ]; then
+            if [ -f "$local_path" ]; then
+                path_type="file"
+            elif [ -d "$local_path" ]; then
+                path_type="dir"
+            else
+                log_warn "Unknown path type: $local_path"
+                continue
+            fi
+        fi
+        
+        log_info "Backing up: $local_path -> $remote_path (type: $path_type)"
+        
+        # 使用临时目录确保一致性
+        local temp_dir="/tmp/rclone-backup-$$-$(date +%s)"
+        mkdir -p "$temp_dir"
+        
+        log_debug "Copying from local to temp: $local_path -> $temp_dir"
+        
+        # 根据类型复制
+        if [ "$path_type" = "file" ]; then
+            # 单个文件
+            log_debug "Detected file: $local_path"
+            if [ -f "$local_path" ]; then
+                cp "$local_path" "$temp_dir/"
+            else
+                log_warn "Path type mismatch: expected file, got directory: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+        else
+            # 目录
+            log_debug "Detected directory: $local_path"
+            if [ -d "$local_path" ]; then
+                # 复制目录内容（不包括目录本身）
+                if [ "$(ls -A $local_path 2>/dev/null)" ]; then
+                    cp -r "$local_path"/* "$temp_dir/" 2>/dev/null || true
+                    # 处理隐藏文件
+                    cp -r "$local_path"/.[!.]* "$temp_dir/" 2>/dev/null || true
+                fi
+            else
+                log_warn "Path type mismatch: expected directory, got file: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+        fi
+        
+        log_debug "Syncing from temp to cloud: $temp_dir -> $remote_path"
+        
+        # 执行 rclone sync（临时目录 -> 云端）
+        if rclone sync "$temp_dir" "$remote_path" \
             ${RCLONE_FLAGS} \
             --log-level INFO 2>&1 | grep -v "^20" || true; then
-            log_info "Backup success: $SRC_DIR"
+            log_info "Backup success: $src_dir"
         else
-            log_error "Backup failed: $SRC_DIR (will retry next cycle)"
+            log_error "Backup failed: $src_dir (will retry next cycle)"
         fi
+        
+        # 清理临时目录
+        rm -rf "$temp_dir"
     done
     
     local end_time=$(date +%s)
@@ -423,34 +571,40 @@ main() {
     log_info "========================================="
     
     # 1. 初始化配置
-    init_config
-    
-    # 2. 恢复数据
-    restore_data
-    
-    # 3. 注册信号处理器
-    trap 'shutdown_handler' SIGTERM SIGINT
-    
-    # 4. 启动后台备份循环
-    (
-        while true; do
-            sleep "$INTERVAL"
-            backup_data
-        done
-    ) &
-    BACKUP_PID=$!
-    log_info "Backup loop started (PID: $BACKUP_PID, interval: ${INTERVAL}s)"
-    
-    # 5. 启动后台快照循环（如果启用）
-    if [ "$SNAPSHOT_ENABLED" = "true" ]; then
+    if init_config; then
+        # 配置成功，启用同步功能
+        
+        # 2. 恢复数据
+        restore_data
+        
+        # 3. 注册信号处理器
+        trap 'shutdown_handler' SIGTERM SIGINT
+        
+        # 4. 启动后台备份循环
         (
             while true; do
-                sleep "$SNAPSHOT_INTERVAL"
-                create_snapshot
+                sleep "$INTERVAL"
+                backup_data
             done
         ) &
-        SNAPSHOT_PID=$!
-        log_info "Snapshot loop started (PID: $SNAPSHOT_PID, interval: ${SNAPSHOT_INTERVAL}s)"
+        BACKUP_PID=$!
+        log_info "Backup loop started (PID: $BACKUP_PID, interval: ${INTERVAL}s)"
+        
+        # 5. 启动后台快照循环（如果启用）
+        if [ "$SNAPSHOT_ENABLED" = "true" ]; then
+            (
+                while true; do
+                    sleep "$SNAPSHOT_INTERVAL"
+                    create_snapshot
+                done
+            ) &
+            SNAPSHOT_PID=$!
+            log_info "Snapshot loop started (PID: $SNAPSHOT_PID, interval: ${SNAPSHOT_INTERVAL}s)"
+        fi
+    else
+        # 配置失败，跳过同步功能，仅启动主应用
+        log_warn "Sync functionality disabled due to configuration error"
+        log_info "Container will start normally without backup/restore"
     fi
     
     # 6. 启动主应用（前台，会阻塞直到应用退出）
