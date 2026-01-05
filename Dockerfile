@@ -1,8 +1,7 @@
-ARG BASE_IMAGE=alpine:latest
-
 # 多阶段构建：从 rclone 官方镜像复制二进制
 FROM rclone/rclone:latest AS rclone-source
 
+ARG BASE_IMAGE=alpine:latest
 FROM ${BASE_IMAGE}
 
 # 1. 接收原始镜像元数据
@@ -24,13 +23,13 @@ COPY --from=rclone-source /usr/local/bin/rclone /usr/local/bin/rclone
 # 智能安装依赖 (兼容 Alpine/Debian/RHEL)
 RUN set -e; \
     if command -v apk > /dev/null; then \
-        apk add --no-cache bash ca-certificates; \
+        apk add --no-cache bash ca-certificates zip unzip; \
     elif command -v apt-get > /dev/null; then \
-        apt-get update && apt-get install -y bash ca-certificates && rm -rf /var/lib/apt/lists/*; \
+        apt-get update && apt-get install -y bash ca-certificates zip unzip && rm -rf /var/lib/apt/lists/*; \
     elif command -v microdnf > /dev/null; then \
-        microdnf install -y bash ca-certificates; \
+        microdnf install -y bash ca-certificates zip unzip; \
     elif command -v yum > /dev/null; then \
-        yum install -y bash ca-certificates; \
+        yum install -y bash ca-certificates zip unzip; \
     else \
         echo "Error: Unsupported package manager (distroless?)."; \
         exit 1; \
@@ -40,7 +39,3 @@ COPY rclone-wrapper.sh /usr/local/bin/rclone-wrapper.sh
 RUN chmod +x /usr/local/bin/rclone-wrapper.sh
 
 ENTRYPOINT ["/usr/local/bin/rclone-wrapper.sh"]
-
-
-
-
