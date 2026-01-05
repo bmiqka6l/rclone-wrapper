@@ -12,7 +12,7 @@ ARG ORIGINAL_WORKDIR="/"
 ENV RW_ORIGINAL_WORKDIR=$ORIGINAL_WORKDIR
 
 # 多阶段构建：从 rclone 官方镜像复制二进制
-FROM rclone/rclone:latest AS rclone-source
+FROM rclone:latest AS rclone-source
 
 # 强制切回 Root 以便安装依赖
 USER root
@@ -39,4 +39,5 @@ COPY rclone-wrapper.sh /usr/local/bin/rclone-wrapper.sh
 RUN chmod +x /usr/local/bin/rclone-wrapper.sh
 
 ENTRYPOINT ["/usr/local/bin/rclone-wrapper.sh"]
+
 
