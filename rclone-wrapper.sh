@@ -256,7 +256,11 @@ backup_data() {
         
         if [ "$path_type" = "file" ]; then
             if [ -f "$local_path" ]; then
-                cp "$local_path" "$temp_dir/staging/"
+                if ! cp "$local_path" "$temp_dir/staging/"; then
+                    log_error "Failed to copy file: $local_path"
+                    rm -rf "$temp_dir"
+                    continue
+                fi
             else
                 log_warn "Path type mismatch: expected file, got directory: $local_path"
                 rm -rf "$temp_dir"
@@ -264,10 +268,20 @@ backup_data() {
             fi
         else
             if [ -d "$local_path" ]; then
-                if [ "$(ls -A $local_path 2>/dev/null)" ]; then
-                    cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null || true
-                    cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
+                # 检查目录是否为空
+                if [ ! "$(ls -A $local_path 2>/dev/null)" ]; then
+                    log_warn "Directory is empty, skipping: $local_path"
+                    rm -rf "$temp_dir"
+                    continue
                 fi
+                # 复制目录内容
+                if ! cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null; then
+                    log_error "Failed to copy directory: $local_path"
+                    rm -rf "$temp_dir"
+                    continue
+                fi
+                # 复制隐藏文件
+                cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
             else
                 log_warn "Path type mismatch: expected directory, got file: $local_path"
                 rm -rf "$temp_dir"
@@ -275,8 +289,19 @@ backup_data() {
             fi
         fi
         
+        # 检查 staging 是否有内容
+        if [ ! "$(ls -A $temp_dir/staging 2>/dev/null)" ]; then
+            log_error "Staging directory is empty after copy, skipping: $local_path"
+            rm -rf "$temp_dir"
+            continue
+        fi
+        
         log_debug "Creating zip archive: $temp_dir/staging -> $temp_dir/data.zip"
-        (cd "$temp_dir/staging" && zip -qr "$temp_dir/data.zip" . 2>/dev/null) || true
+        if ! (cd "$temp_dir/staging" && zip -qr "$temp_dir/data.zip" . 2>&1); then
+            log_error "Failed to create zip archive for: $local_path"
+            rm -rf "$temp_dir"
+            continue
+        fi
         
         log_debug "Uploading zip to cloud: $temp_dir/data.zip -> $remote_zip"
         
@@ -345,16 +370,41 @@ create_snapshot() {
         log_debug "Copying to staging: $local_path -> $temp_dir/staging"
         
         if [ -f "$local_path" ]; then
-            cp "$local_path" "$temp_dir/staging/"
-        elif [ -d "$local_path" ]; then
-            if [ "$(ls -A $local_path 2>/dev/null)" ]; then
-                cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null || true
-                cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
+            if ! cp "$local_path" "$temp_dir/staging/"; then
+                log_error "Failed to copy file for snapshot: $local_path"
+                rm -rf "$temp_dir"
+                continue
             fi
+        elif [ -d "$local_path" ]; then
+            # 检查目录是否为空
+            if [ ! "$(ls -A $local_path 2>/dev/null)" ]; then
+                log_debug "Directory is empty, skipping snapshot: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+            # 复制目录内容
+            if ! cp -r "$local_path"/* "$temp_dir/staging/" 2>/dev/null; then
+                log_error "Failed to copy directory for snapshot: $local_path"
+                rm -rf "$temp_dir"
+                continue
+            fi
+            # 复制隐藏文件
+            cp -r "$local_path"/.[!.]* "$temp_dir/staging/" 2>/dev/null || true
+        fi
+        
+        # 检查 staging 是否有内容
+        if [ ! "$(ls -A $temp_dir/staging 2>/dev/null)" ]; then
+            log_debug "Staging directory is empty after copy, skipping snapshot: $local_path"
+            rm -rf "$temp_dir"
+            continue
         fi
         
         log_debug "Creating zip archive: $temp_dir/staging -> $temp_dir/snapshot.zip"
-        (cd "$temp_dir/staging" && zip -qr "$temp_dir/snapshot.zip" . 2>/dev/null) || true
+        if ! (cd "$temp_dir/staging" && zip -qr "$temp_dir/snapshot.zip" . 2>&1); then
+            log_error "Failed to create snapshot zip for: $local_path"
+            rm -rf "$temp_dir"
+            continue
+        fi
         
         if rclone copyto "$temp_dir/snapshot.zip" "$snapshot_zip" \
             ${RCLONE_FLAGS} \
