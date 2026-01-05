@@ -21,7 +21,7 @@
 |--------|------|------|
 | `RW_RCLONE_CONFIG` | BASE64 编码的 rclone.conf | `W3MzXQp0eXBlID0gczM...` |
 | `RW_BASE_DIR` | 云存储中的基础目录 | `my-app-data` |
-| `RW_SYNC_MAP` | 路径映射（格式：`src_dir:/container/path`） | `data:/var/lib/app;conf:/etc/app` |
+| `RW_SYNC_MAP` | 路径映射，支持三种格式：<br>1. `src_dir:/container/path` (自动判断)<br>2. `dir:src_dir:/container/path` (明确指定目录)<br>3. `file:src_dir:/container/path` (明确指定文件) | `data:/var/lib/app;conf:/etc/app`<br>或<br>`dir:data:/var/lib/app;file:config:app.conf` |
 
 ### 可选变量
 
@@ -48,33 +48,41 @@
 │         Docker Container                │
 │                                         │
 │  1. Restore (启动时)                    │
-│     └─> 从云存储下载数据到容器          │
+│     └─> 下载 ZIP → 解压到容器           │
 │                                         │
 │  2. Main App (前台运行)                 │
 │     └─> 原始应用正常运行                │
 │                                         │
 │  3. Background Loops (后台)             │
 │     ├─> 定期备份 (每 5 分钟)            │
+│     │   └─> 复制 → 打包 ZIP → 上传      │
 │     └─> 定期快照 (每 15 分钟)           │
+│         └─> 复制 → 打包 ZIP → 上传      │
 │                                         │
 │  4. Graceful Shutdown (关闭时)          │
 │     └─> 最后一次强制备份                │
 └─────────────────────────────────────────┘
                   │
-                  │ rclone
+                  │ rclone (单文件传输)
                   ▼
        ┌──────────────────────┐
        │   Cloud Storage      │
        │                      │
        │  BASE_DIR/           │
-       │  ├─ data/            │  ← 实时数据
-       │  ├─ conf/            │
-       │  └─ snapshots/       │  ← 历史快照
-       │     ├─ 20260105_120000/
-       │     ├─ 20260105_121500/
+       │  ├─ data.zip         │  ← 实时数据（压缩）
+       │  ├─ conf.zip         │
+       │  └─ snapshots/       │  ← 历史快照（压缩）
+       │     ├─ 20260105_120000_data.zip
+       │     ├─ 20260105_121500_data.zip
        │     └─ ...           │
        └──────────────────────┘
 ```
+
+**ZIP 压缩优势：**
+- ✅ 大幅提升传输速度（单文件 vs 多文件）
+- ✅ 减少 API 调用次数（降低成本）
+- ✅ 避免并发问题（先复制再打包）
+- ✅ 节省存储空间（压缩）
 
 ## 📦 如何使用
 
@@ -515,8 +523,9 @@ docker run -d \
 
 ### 性能优化
 
-- **启动速度**：wrapper 只同步实时数据，自动排除快照目录
-- **增量同步**：rclone 自动检测文件变化，只传输修改的部分
+- **ZIP 压缩传输**：所有数据先打包成 ZIP 再传输，大幅提升速度
+- **并发安全**：先复制到临时目录再打包，避免并发写入问题
+- **增量同步**：只传输单个 ZIP 文件，减少 API 调用
 - **自定义参数**：通过 `RW_RCLONE_FLAGS` 环境变量传递额外的 rclone 参数
 
 ### 数据安全
@@ -768,3 +777,34 @@ MIT License
 
 欢迎提交 Issue 和 Pull Request！
 
+
+## 📌 SYNC_MAP 格式详解
+
+`RW_SYNC_MAP` 支持三种格式，用分号 `;` 分隔多个映射：
+
+### 1. 自动判断：`src_dir:/container/path`
+- 通过文件扩展名猜测类型
+- 有扩展名（如 `.conf`）→ 文件
+- 无扩展名 → 目录
+- 如果远程已存在，优先使用远程判断
+
+### 2. 明确指定目录：`dir:src_dir:/container/path`
+- 强制作为目录处理
+- 适用于无扩展名但实际是目录的路径
+
+### 3. 明确指定文件：`file:src_dir:/container/path`
+- 强制作为单文件处理
+- 适用于配置文件等单文件场景
+
+### 示例
+
+```bash
+# 混合使用
+-e RW_SYNC_MAP="dir:data:/var/lib/mysql;file:config:/etc/app/app.conf;logs:/var/log/app"
+
+# 纯自动判断
+-e RW_SYNC_MAP="html:/usr/share/nginx/html;nginx.conf:/etc/nginx/nginx.conf"
+
+# 单文件配置
+-e RW_SYNC_MAP="file:appconf:/app/config.json"
+```
