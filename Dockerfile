@@ -1,7 +1,8 @@
+ARG BASE_IMAGE=alpine:latest
+
 # 多阶段构建：从 rclone 官方镜像复制二进制
 FROM rclone/rclone:latest AS rclone-source
 
-ARG BASE_IMAGE=alpine:latest
 FROM ${BASE_IMAGE}
 
 # 1. 接收原始镜像元数据
@@ -39,6 +40,7 @@ COPY rclone-wrapper.sh /usr/local/bin/rclone-wrapper.sh
 RUN chmod +x /usr/local/bin/rclone-wrapper.sh
 
 ENTRYPOINT ["/usr/local/bin/rclone-wrapper.sh"]
+
 
 
 
