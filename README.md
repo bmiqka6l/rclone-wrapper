@@ -13,7 +13,7 @@
 - ✅ **完全兼容**：保持原始镜像的所有功能和行为
 - ✅ **多发行版支持**：Alpine、Debian、Ubuntu、RHEL 等
 
-## � 环境变用量配置
+## 环境变用量配置
 
 ### 必填变量
 
@@ -429,7 +429,7 @@ docker run -d \
   my-nginx-with-sync
 ```
 
-## � 配置示例配
+## 配置示例
 
 ### AWS S3
 
@@ -767,3 +767,4 @@ MIT License
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
+
