@@ -540,8 +540,27 @@ start_main_app() {
     log_debug "CMD: $ORIGINAL_CMD"
     log_debug "Executing: $cmd_str"
     
+    local run_cmd="$cmd_str"
+    
+    case "$run_cmd" in
+        "/bin/sh -c "*)
+            run_cmd="${run_cmd#/bin/sh -c }"
+            ;;
+        "/bin/bash -c "*)
+            run_cmd="${run_cmd#/bin/bash -c }"
+            ;;
+        "sh -c "*)
+            run_cmd="${run_cmd#sh -c }"
+            ;;
+    esac
+    
+    run_cmd=$(echo "$run_cmd" | sed 's/^[[:space:]]*//')
+
+    log_debug "Original CMD: $cmd_str"
+    log_debug "Cleaned CMD:  $run_cmd"
+    
     set -m
-    eval "$cmd_str" 2>&1 &
+    eval "$run_cmd" 2>&1 &
     APP_PID=$!
     
     log_debug "App PID: $APP_PID"
