@@ -541,7 +541,7 @@ start_main_app() {
     log_debug "Executing: $cmd_str"
     
     set -m
-    $cmd_str 2>&1 &
+    eval "$cmd_str" 2>&1 &
     APP_PID=$!
     
     log_debug "App PID: $APP_PID"
